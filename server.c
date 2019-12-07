@@ -1,230 +1,366 @@
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
 #include <string.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <pthread.h>
-#include <sys/types.h>
-#include <signal.h>
 
-#define MAX_CLIENTS 100
-#define BUFFER_SZ 2048
 
-static _Atomic unsigned int cli_count = 0;
-static int uid = 10;
+#define BUF_SIZE 4096
 
-/* Client structure */
-typedef struct{
-	struct sockaddr_in address;
-	int sockfd;
-	int uid;
-	char name[32];
-} client_t;
 
-client_t *clients[MAX_CLIENTS];
+pthread_mutex_t list_loc;
 
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void str_overwrite_stdout() {
-    printf("\r%s", "> ");
-    fflush(stdout);
+struct Node
+{
+	char * name;
+	int socket;
+	struct Node * prev;
+};
+
+
+typedef struct Node Node;
+
+
+static volatile Node * head = 0;
+
+
+void addClient(int socket, char * name)
+{
+	pthread_mutex_lock(&list_loc);
+
+	Node * n = malloc(sizeof(Node));
+	int len = strlen(name);
+	char * new_name = malloc(len + 1);
+	strcpy(new_name, name);
+	new_name[len] = 0;
+	n->name = new_name;
+	n->socket = socket;	
+	n->prev = head;
+	head = n;
+
+	pthread_mutex_unlock(&list_loc);
 }
 
-void str_trim_lf (char* arr, int length) {
-  int i;
-  for (i = 0; i < length; i++) { // trim \n
-    if (arr[i] == '\n') {
-      arr[i] = '\0';
-      break;
-    }
-  }
-}
 
-void print_client_addr(struct sockaddr_in addr){
-    printf("%d.%d.%d.%d",
-        addr.sin_addr.s_addr & 0xff,
-        (addr.sin_addr.s_addr & 0xff00) >> 8,
-        (addr.sin_addr.s_addr & 0xff0000) >> 16,
-        (addr.sin_addr.s_addr & 0xff000000) >> 24);
-}
+int checkClient(char * name)
+{
+	pthread_mutex_lock(&list_loc);
 
-/* Add clients to queue */
-void queue_add(client_t *cl){
-	pthread_mutex_lock(&clients_mutex);
-
-	for(int i=0; i < MAX_CLIENTS; ++i){
-		if(!clients[i]){
-			clients[i] = cl;
-			break;
+	Node t = *head;
+	Node * temp = &t;
+	while ( temp->prev != 0)
+	{
+		if (strcmp ( temp->name, name) == 0)
+		{
+			pthread_mutex_unlock(&list_loc);
+			return 0;
 		}
+		temp = temp -> prev;
 	}
 
-	pthread_mutex_unlock(&clients_mutex);
+	pthread_mutex_unlock(&list_loc);
+	return 1;
 }
 
-/* Remove clients to queue */
-void queue_remove(int uid){
-	pthread_mutex_lock(&clients_mutex);
 
-	for(int i=0; i < MAX_CLIENTS; ++i){
-		if(clients[i]){
-			if(clients[i]->uid == uid){
-				clients[i] = NULL;
-				break;
+int messageClient(char * response, char * name, int client_sock)
+{
+	int n_size = strlen(name) + 2;
+
+	response = response + 1;
+	int i = 0;
+	while ( response[i] != ' ' )
+	{
+		i++;
+	}
+
+	char dest_name[i + 1];
+	response[i] = 0;
+	strcpy(dest_name, response);
+	dest_name[i] = 0;
+
+	char * tp = &response[i + 1];
+	i = strlen(tp);
+
+	char actual_response[i + n_size + 1];
+
+	strcpy(actual_response, name);
+	actual_response[n_size - 2] = ':';
+	actual_response[n_size - 1] = ' ';
+	actual_response[n_size] = 0;
+
+	strcpy(&actual_response[n_size], tp);
+	actual_response[i + n_size] = 0;
+
+	response = actual_response;
+
+	pthread_mutex_lock(&list_loc);
+
+	Node * temp = head;
+	while ( temp->prev != 0)
+	{
+		if (strcmp ( temp->name, dest_name) == 0)
+		{
+			if ( write(temp->socket, response, strlen(response)) < 0 )
+			{
+				perror("write ");
+				pthread_mutex_unlock(&list_loc);
+				removeClient(name);
+				close(client_sock);
+				pthread_exit(1);
 			}
+			pthread_mutex_unlock(&list_loc);
+			return 0;
 		}
+		temp = temp -> prev;
 	}
 
-	pthread_mutex_unlock(&clients_mutex);
+	pthread_mutex_unlock(&list_loc);
+	return 1;
 }
 
-/* Send message to all clients except sender */
-void send_message(char *s, int uid){
-	pthread_mutex_lock(&clients_mutex);
 
-	for(int i=0; i<MAX_CLIENTS; ++i){
-		if(clients[i]){
-			if(clients[i]->uid != uid){
-				if(write(clients[i]->sockfd, s, strlen(s)) < 0){
-					perror("ERROR: write to descriptor failed");
-					break;
-				}
-			}
+void populateClient(char * response)
+{
+	pthread_mutex_lock(&list_loc);
+
+	Node * temp = head;
+	int i = 0;
+	int name_size = 0;
+	int j = 0;
+	while ( temp->prev != 0 && i < BUF_SIZE - 1)
+	{
+		name_size = strlen(temp->name);
+		j = 0;
+		while ( j < name_size && i < BUF_SIZE - 1)
+		{
+			response[i] = temp->name[j];
+			i++;
+			j++;
 		}
+		response[i] = '\n';
+		i++;
+		temp = temp->prev;
 	}
+	response[i - 1] = 0;
 
-	pthread_mutex_unlock(&clients_mutex);
+	pthread_mutex_unlock(&list_loc);
 }
 
-/* Handle all communication with the client */
-void *handle_client(void *arg){
-	char buff_out[BUFFER_SZ];
-	char name[32];
-	int leave_flag = 0;
 
-	cli_count++;
-	client_t *cli = (client_t *)arg;
+int removeClient(char * name)
+{
+	pthread_mutex_lock(&list_loc);
 
-	// Name
-	if(recv(cli->sockfd, name, 32, 0) <= 0 || strlen(name) <  2 || strlen(name) >= 32-1){
-		printf("Didn't enter the name.\n");
-		leave_flag = 1;
-	} else{
-		strcpy(cli->name, name);
-		sprintf(buff_out, "%s has joined\n", cli->name);
-		printf("%s", buff_out);
-		send_message(buff_out, cli->uid);
+	if ( head-> prev == 0)
+	{
+		pthread_mutex_unlock(&list_loc);
+		return 1;
+	}
+	if ( strcmp(name, head->name) == 0)
+	{
+		Node * temp = head;
+		head = head -> prev;
+		free(temp->name);
+		free(temp);
+		pthread_mutex_unlock(&list_loc);
+		return 0;
 	}
 
-	bzero(buff_out, BUFFER_SZ);
+	Node * n = head;
+	while ( n-> prev -> prev != 0)
+	{
+		if (strcmp(name, n->prev->name) == 0)
+		{
+			Node * tmp = n->prev;
+			n->prev = n->prev->prev;
+			free(tmp->name);
+			free(tmp);
+			pthread_mutex_unlock(&list_loc);
+			return 0;
+		}
+		n = n-> prev;
+	}
+
+	pthread_mutex_unlock(&list_loc);
+
+	return 1;
+}
+
+
+void * readClient(void * client_s)
+{
+	int client_sock = client_s;
+	char response[BUF_SIZE];           //what to send to the client
+	int n;                             //length measure
+
+	response[0] = 0;
+	n = read(client_sock, response, BUF_SIZE - 1);
+
+	if (n < 0)
+	{
+		perror("read ");
+		close(client_sock);
+		pthread_exit(1);
+	}
+
+	char name[strlen(response) + 1];
+	strcpy(name, response);
+	name[strlen(response)] = 0;
+
+	if ( checkClient(response) == 0)
+	{
+		strcpy(response, "clash");
+		if ( write(client_sock, response, strlen(response)) < 0 )
+		{
+			perror("write ");
+		}
+		close(client_sock);
+		pthread_exit(1);
+	}
+	else
+	{
+		strcpy(response, "accept");
+	}
+
+	if ( write(client_sock, response, strlen(response)) < 0 )
+	{
+		perror("write ");
+		close(client_sock);
+		pthread_exit(1);
+	}
+
+	addClient(client_sock, name);
+
+	int send;
 
 	while(1){
-		if (leave_flag) {
-			break;
+
+		send = 0;
+
+		if((n = read(client_sock,response, BUF_SIZE-1)) < 0){
+			perror("read");
+			removeClient(name);
+			close(client_sock);
+			pthread_exit(1);
 		}
 
-		int receive = recv(cli->sockfd, buff_out, BUFFER_SZ, 0);
-		if (receive > 0){
-			if(strlen(buff_out) > 0){
-				send_message(buff_out, cli->uid);
-
-				str_trim_lf(buff_out, strlen(buff_out));
-				printf("%s -> %s\n", buff_out, cli->name);
+		if ( response[0] == '0')
+		{
+			removeClient(name);
+			close(client_sock);
+			pthread_exit(1);
+		}
+		else if ( response[0] == '1')
+		{
+			populateClient(response);
+			send = 1;
+		}
+		else if ( response[0] == '2')
+		{
+			response[n] = 0;
+			int r = messageClient(response, name, client_sock);
+			if ( r == 1 )
+			{
+				char back_rsp[] = "Client name not found ";
+				strcpy(response, back_rsp);
+				response[strlen(back_rsp)] = 0;
+				send = 1;
 			}
-		} else if (receive == 0 || strcmp(buff_out, "exit") == 0){
-			sprintf(buff_out, "%s has left\n", cli->name);
-			printf("%s", buff_out);
-			send_message(buff_out, cli->uid);
-			leave_flag = 1;
-		} else {
-			printf("ERROR: -1\n");
-			leave_flag = 1;
 		}
 
-		bzero(buff_out, BUFFER_SZ);
-	}
-
-  /* Delete client from queue and yield thread */
-	close(cli->sockfd);
-  queue_remove(cli->uid);
-  free(cli);
-  cli_count--;
-  pthread_detach(pthread_self());
-
-	return NULL;
-}
-
-int main(int argc, char **argv){
-	if(argc != 2){
-		printf("Usage: %s <port>\n", argv[0]);
-		return EXIT_FAILURE;
-	}
-
-	char *ip = "127.0.0.1";
-	int port = atoi(argv[1]);
-	int option = 1;
-	int listenfd = 0, connfd = 0;
-  struct sockaddr_in serv_addr;
-  struct sockaddr_in cli_addr;
-  pthread_t tid;
-
-  /* Socket settings */
-  listenfd = socket(AF_INET, SOCK_STREAM, 0);
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_addr.s_addr = inet_addr(ip);
-  serv_addr.sin_port = htons(port);
-
-  /* Ignore pipe signals */
-	signal(SIGPIPE, SIG_IGN);
-
-	if(setsockopt(listenfd, SOL_SOCKET,(SO_REUSEPORT | SO_REUSEADDR),(char*)&option,sizeof(option)) < 0){
-		perror("ERROR: setsockopt failed");
-    return EXIT_FAILURE;
-	}
-
-	/* Bind */
-  if(bind(listenfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-    perror("ERROR: Socket binding failed");
-    return EXIT_FAILURE;
-  }
-
-  /* Listen */
-  if (listen(listenfd, 10) < 0) {
-    perror("ERROR: Socket listening failed");
-    return EXIT_FAILURE;
-	}
-
-	printf("=== WELCOME TO THE CHATROOM ===\n");
-
-	while(1){
-		socklen_t clilen = sizeof(cli_addr);
-		connfd = accept(listenfd, (struct sockaddr*)&cli_addr, &clilen);
-
-		/* Check if max clients is reached */
-		if((cli_count + 1) == MAX_CLIENTS){
-			printf("Max clients reached. Rejected: ");
-			print_client_addr(cli_addr);
-			printf(":%d\n", cli_addr.sin_port);
-			close(connfd);
-			continue;
+		//send response
+		if ( send  == 1)
+		{
+			if(write(client_sock, response, strlen(response)) < 0){
+				removeClient(name);
+				close(client_sock);
+				pthread_exit(1);
+			}			
 		}
+	}
+}
 
-		/* Client settings */
-		client_t *cli = (client_t *)malloc(sizeof(client_t));
-		cli->address = cli_addr;
-		cli->sockfd = connfd;
-		cli->uid = uid++;
 
-		/* Add client to the queue and fork thread */
-		queue_add(cli);
-		pthread_create(&tid, NULL, &handle_client, (void*)cli);
 
-		/* Reduce CPU usage */
-		sleep(1);
+
+
+int main(int argc, char * argv[])
+{
+	head = malloc(sizeof(Node));
+	head->prev = 0;
+	head->socket = -1;
+	head->name = 0;
+
+	if (argc < 2)
+	{
+		printf("No port specified\n");
+		exit(0);
 	}
 
-	return EXIT_SUCCESS;
+  	char hostname[] = "127.0.0.1";   //localhost ip address to bind to
+  	short port = atoi(argv[1]);               //the port we are to bind to
+
+	struct sockaddr_in saddr_in;  //socket interent address of server
+	struct sockaddr_in client_saddr_in;  //socket interent address of client
+
+	socklen_t saddr_len = sizeof(struct sockaddr_in); //length of address
+
+	int server_sock, client_sock;         //socket file descriptor
+
+	//set up the address information
+	saddr_in.sin_family = AF_INET;
+	inet_aton(hostname, &saddr_in.sin_addr);
+	saddr_in.sin_port = htons(port);
+
+	//open a socket
+	if( (server_sock = socket(AF_INET, SOCK_STREAM, 0))  < 0){
+	    perror("socket");
+	    exit(1);
+	}
+
+	//bind the socket
+	if( bind(server_sock, (struct sockaddr *) &saddr_in, saddr_len) < 0 ){
+		perror("bind");
+		exit(1);
+	}
+
+	//ready to listen, queue up to 5 pending connectinos
+	if( listen(server_sock, 5)  < 0 ){
+		perror("listen");
+		exit(1);
+	}
+
+	saddr_len = sizeof(struct sockaddr_in); //length of address
+
+	printf("Listening On: %s:%d\n", inet_ntoa(saddr_in.sin_addr), ntohs(saddr_in.sin_port));
+
+	//accept incoming connections
+
+	pthread_t p;
+
+	while (1 == 1)
+	{
+		if((client_sock = accept(server_sock, (struct sockaddr *) &client_saddr_in, &saddr_len)) < 0){
+			perror("accept");
+			exit(1);
+		}
+		//read from client
+		if ( pthread_create(&p, NULL, readClient, (void *)client_sock) < 0 )
+		{
+			perror("thread ");
+		}
+	}
+
+	printf("Closing socket\n\n");
+
+	//close the socket
+	close(server_sock);
+
+	return 0; //success
 }
+

@@ -1,140 +1,216 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <pthread.h>
 
-#define LENGTH 2048
 
-// Global variables
-volatile sig_atomic_t flag = 0;
-int sockfd = 0;
-char name[32];
+#define BUFFER_SZIE 4096
 
-void str_overwrite_stdout() {
-  printf("%s", "> ");
-  fflush(stdout);
-}
 
-void str_trim_lf (char* arr, int length) {
-  int i;
-  for (i = 0; i < length; i++) { // trim \n
-    if (arr[i] == '\n') {
-      arr[i] = '\0';
-      break;
+static volatile int sock = -1;
+
+
+void * reading(void * args)
+{
+  int n;
+  char response[BUFFER_SZIE + 1];
+
+  n = read(sock, response, BUFFER_SZIE);
+  if ( n < 0 )
+  {
+    perror("read ");
+    exit(1);
+  }
+  else if ( strcmp(response, "clash") == 0)
+  {
+    printf("Name clashes with an existing client\n");
+    exit(1);
+  }
+  else if ( strcmp(response, "accept") != 0 )
+  {
+    printf("Some other error occured in connecting to server\n");
+    exit(1);
+  }
+  else
+  {
+    printf("Connected succesfully. \n Available commands are /quit /list /msg clientname message\n");
+  }
+  
+
+  while( (n = read(sock, response, BUFFER_SZIE)) > 0){
+    response[n] = '\n';
+    //write response to stdout
+    if(write(1, response, n + 1) < 0){
+      perror("write");
+      exit(1);
     }
   }
-}
 
-void catch_ctrl_c_and_exit(int sig) {
-    flag = 1;
-}
+  //read the response until EOF
 
-void send_msg_handler() {
-  char message[LENGTH] = {};
-	char buffer[LENGTH + 32] = {};
-
-  while(1) {
-  	str_overwrite_stdout();
-    fgets(message, LENGTH, stdin);
-    str_trim_lf(message, LENGTH);
-
-    if (strcmp(message, "exit") == 0) {
-			break;
-    } else {
-      sprintf(buffer, "%s: %s\n", name, message);
-      send(sockfd, buffer, strlen(buffer), 0);
-    }
-
-		bzero(message, LENGTH);
-    bzero(buffer, LENGTH + 32);
+  if (n<0){
+    perror("read");
+    exit(1);
   }
-  catch_ctrl_c_and_exit(2);
+
 }
 
-void recv_msg_handler() {
-	char message[LENGTH] = {};
-  while (1) {
-		int receive = recv(sockfd, message, LENGTH, 0);
-    if (receive > 0) {
-      printf("%s", message);
-      str_overwrite_stdout();
-    } else if (receive == 0) {
-			break;
-    } else {
-			// -1
-		}
-		memset(message, 0, sizeof(message));
+
+int checkValidMessage(char * str)
+{
+  int len = strlen(str);
+  if (len < 6)
+  {
+    return 0;
   }
+  char buff[] = "/msg ";
+  char buff2[len + 1];
+  strcpy(buff2, str);
+  buff2[5] = 0;
+  if ( (strcmp(buff2, buff) != 0) )
+  {
+    return 0;
+  }
+  strcpy(buff2, str);
+  buff2[len] = 0;
+
+  char * token;
+  int i = 0;
+
+  token = strtok(buff2, " ");
+  while ( token != 0)
+  {
+    i++;
+    token = strtok(NULL, " ");
+  }
+
+  if(i < 3)
+  {
+    return 0;
+  }
+
+  return 1;
 }
 
-int main(int argc, char **argv){
-	if(argc != 2){
-		printf("Usage: %s <port>\n", argv[0]);
-		return EXIT_FAILURE;
-	}
 
-	char *ip = "127.0.0.1";
-	int port = atoi(argv[1]);
+int main(int argc, char * argv[]){
 
-	signal(SIGINT, catch_ctrl_c_and_exit);
+  if ( argc < 4 )
+  {
+    printf("Insufficient number of parameters\n");
+    exit(0);
+  }
 
-	printf("Please enter your name: ");
-  fgets(name, 32, stdin);
-  str_trim_lf(name, strlen(name));
+  char * hostname = argv[1];    //the hostname we are looking up
+  short port = atoi(argv[2]);                 //the port we are connecting on
+
+  struct addrinfo *result;       //to store results
+  struct addrinfo hints;         //to indicate information we want
+
+  struct sockaddr_in *saddr_in;  //socket interent address
+
+  int s,n;                       //for error checking
+
+  pthread_t p;
+
+  //setup our hints
+  memset(&hints,0,sizeof(struct addrinfo));  //zero out hints
+  hints.ai_family = AF_INET; //we only want IPv4 addresses
+
+  //Convert the hostname to an address
+  if( (s = getaddrinfo(hostname, NULL, &hints, &result)) != 0){
+    fprintf(stderr, "getaddrinfo: %s\n",gai_strerror(s));
+    exit(1);
+  }
+
+  //convert generic socket address to inet socket address
+  saddr_in = (struct sockaddr_in *) result->ai_addr;
+
+  //set the port in network byte order
+  saddr_in->sin_port = htons(port);
+
+  //open a socket
+  if( (sock = socket(AF_INET, SOCK_STREAM, 0))  < 0){
+    perror("socket");
+    exit(1);
+  }
+
+  //connect to the server
+  if(connect(sock, (struct sockaddr *) saddr_in, sizeof(*saddr_in)) < 0){
+    perror("connect");
+    exit(1);
+  }
+
+  char * request;
+  size_t s_message;
+
+  int quit = 0;
+  int send = 0;
+
+  if (pthread_create(&p, NULL, reading, NULL) < 0 )
+  {
+    perror("thread ");
+    exit(1);
+  }
+
+  if ( write(sock, argv[3], strlen(argv[3])) < 0 )
+  {
+    perror("write ");
+  }
 
 
-	if (strlen(name) > 32 || strlen(name) < 2){
-		printf("Name must be less than 30 and more than 2 characters.\n");
-		return EXIT_FAILURE;
-	}
-
-	struct sockaddr_in server_addr;
-
-	/* Socket settings */
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = inet_addr(ip);
-  server_addr.sin_port = htons(port);
-
-
-  // Connect to Server
-  int err = connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
-  if (err == -1) {
-		printf("ERROR: connect\n");
-		return EXIT_FAILURE;
-	}
-
-	// Send name
-	send(sockfd, name, 32, 0);
-
-	printf("=== WELCOME TO THE CHATROOM ===\n");
-
-	pthread_t send_msg_thread;
-  if(pthread_create(&send_msg_thread, NULL, (void *) send_msg_handler, NULL) != 0){
-		printf("ERROR: pthread\n");
-    return EXIT_FAILURE;
-	}
-
-	pthread_t recv_msg_thread;
-  if(pthread_create(&recv_msg_thread, NULL, (void *) recv_msg_handler, NULL) != 0){
-		printf("ERROR: pthread\n");
-		return EXIT_FAILURE;
-	}
-
-	while (1){
-		if(flag){
-			printf("\nBye\n");
-			break;
+  while(quit == 0)
+  {
+    request = 0;
+    send = 0;
+    s_message = getline(&request, &s_message, stdin);
+    request[s_message - 1] = 0;
+    if (strcmp(request, "/quit") == 0)
+    {
+      quit = 1;
+      send = 1;
+      request[0] = '0';
+      request[1] = 0;
     }
-	}
+    else if ( strcmp (request, "/list") == 0)
+    {
+      send = 1;
+      request[0] = '1';
+      request[1] = 0;
+    }
+    else if ( checkValidMessage(request) == 1)
+    {
+      send = 1;
+      request[0] = '2';
+      int i = 5;
+      while( request [i] != 0)
+      {
+        request[i - 4] = request[i];
+        i++;
+      }
+      request[i - 4] = 0;
+    }
+    if ( send != 1)
+    {
+      printf("Invalid command \n");
+    }
+    else
+    {
+    //send the request
+      if(write(sock,request,strlen(request)) < 0){
+        perror("send");
+      }      
+    }
+    free(request);
+  }
 
-	close(sockfd);
+  //close the socket
+  close(sock);
 
-	return EXIT_SUCCESS;
+  return 0; //success
 }
+
